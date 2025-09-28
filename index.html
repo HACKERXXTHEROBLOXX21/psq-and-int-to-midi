@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>PSQ+INT → MIDI (browser helper)</title>
+<style>
+  body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;max-width:900px;margin:24px auto;padding:12px}
+  input,button{font-size:15px;padding:8px;margin:6px 0}
+  pre{background:#111;color:#dff;padding:12px;border-radius:6px;overflow:auto}
+  .ok{color:green}.warn{color:orange}.err{color:#c55}
+</style>
+</head>
+<body>
+  <h1>PSQ + INT → MIDI (GitHub Pages helper)</h1>
+  <p>Upload a <code>.psq</code> and its matching <code>.int</code>. The page will extract HD/SQ/BD blocks and either try a WASM converter (if provided) or package them for desktop conversion (VGMToolbox/VGMTrans/etc.).</p>
+
+  <label>PSQ file: <input type="file" id="psqInput" accept=".psq,.PSQ" /></label><br/>
+  <label>INT file: <input type="file" id="intInput" accept=".int,.INT" /></label><br/>
+  <label>Optional wasm converter (psq→midi): <input type="file" id="wasmInput" accept=".wasm" /></label><br/>
+  <button id="runBtn">Extract & Convert</button>
+  <div id="log"></div>
+
+  <h3>Output</h3>
+  <div id="outputs"></div>
+
+<script>
+/*
+  Browser-side helper for extracting HD / SQ / BD segments from .psq/.int files.
+  - It searches for ASCII markers "HD", "SQ", "BD" (simple heuristic).
+  - If a psq2mid wasm is provided by the user, the script attempts to call a function:
+        convert_psq_to_midi(pointer_to_sq_buffer, sq_size, pointer_to_bd_buffer, bd_size) -> returns pointer to midi data
+    (YOU must compile/implement such a wasm module yourself; see code comments further down.)
+  - If no wasm converter is present, the script offers downloads of extracted .SQ/.HD/.BD and a ZIP for desktop conversion.
+*/
+
+async function readFileAsArrayBuffer(file){
+  return await file.arrayBuffer();
+}
+
+function log(msg, cls=''){
+  const d=document.getElementById('log');
+  const p=document.createElement('pre');
+  if(cls) p.className=cls;
+  p.textContent=msg;
+  d.appendChild(p);
+  d.scrollIntoView({behavior:'smooth'});
+}
+
+// simple search for ASCII tokens and extract chunk from file
+function findAndSlice(buffer, token){
+  const bytes = new Uint8Array(buffer);
+  const tokenBytes = new TextEncoder().encode(token);
+  // naive search
+  for(let i=0;i<=bytes.length-tokenBytes.length;i++){
+    let ok=true;
+    for(let j=0;j<tokenBytes.length;j++){
+      if(bytes[i+j]!==tokenBytes[j]){ ok=false; break; }
+    }
+    if(ok){
+      // Heuristic: chunk length stored in little-endian 32-bit after token? Not universal.
+      // We'll slice from token start to next token or end.
+      // Find next occurrence of ASCII token header (two uppercase letters) — crude but often works.
+      let j=i+tokenBytes.length;
+      // find next all-caps-two-letter sequence occurrence as next header
+      while(j<bytes.length-1){
+        const a=bytes[j], b=bytes[j+1];
+        if(a>=65 && a<=90 && b>=65 && b<=90 && (j-i)>4){
+          break;
+        }
+        j++;
+      }
+      return bytes.slice(i, j);
+    }
+  }
+  return null;
+}
+
+function downloadBlob(data, name, type='application/octet-stream'){
+  const blob = new Blob([data], {type});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = name;
+  a.textContent = `Download ${name}`;
+  a.style.display='inline-block';
+  a.style.margin='6px';
+  document.getElementById('outputs').appendChild(a);
+}
+
+document.getElementById('runBtn').addEventListener('click', async ()=>{
+  document.getElementById('log').innerHTML=''; document.getElementById('outputs').innerHTML='';
+  const psqFile = document.getElementById('psqInput').files[0];
+  const intFile = document.getElementById('intInput').files[0];
+  const wasmFile = document.getElementById('wasmInput').files[0];
+
+  if(!psqFile || !intFile){ log('Please select both PSQ and INT files.', 'err'); return; }
+  log('Reading files...');
+  const psqBuf = await readFileAsArrayBuffer(psqFile);
+  const intBuf = await readFileAsArrayBuffer(intFile);
+
+  log(`PSQ size: ${psqBuf.byteLength} bytes\nINT size: ${intBuf.byteLength} bytes`, 'ok');
+
+  // try to locate SQ/HD/BD blocks
+  const found = {};
+  ['SQ','HD','BD'].forEach(tok=>{
+    // search in PSQ then INT
+    let slice = findAndSlice(psqBuf, tok);
+    if(!slice) slice = findAndSlice(intBuf, tok);
+    if(slice) {
+      found[tok]=slice;
+      log(`Found ${tok} block — ${slice.length} bytes`, 'ok');
+      // create downloadable blob for inspection
+      downloadBlob(slice, `${tok}.bin`);
+    } else {
+      log(`No ${tok} block found (heuristic).`, 'warn');
+    }
+  });
+
+  // If user provided a wasm converter, try to load it and call conversion
+  if(wasmFile){
+    log('WASM converter provided — attempting to run it (experimental).', 'ok');
+    try{
+      const wasmBytes = await readFileAsArrayBuffer(wasmFile);
+      // instantiate wasm module with simple imports
+      const imports = {
+        env: {
+          // memory will be created by module or we provide it - keep minimal
+          abort: ()=>{ throw new Error('WASM abort'); },
+        }
+      };
+      const {instance} = await WebAssembly.instantiate(wasmBytes, imports);
+      const exports = instance.exports;
+      log('WASM instantiated. exports: '+Object.keys(exports).join(', '));
+
+      // Expecting specific exported functions: malloc, free, convert_psq_to_midi (name depend on your compile)
+      if(!exports.malloc || !exports.free || !exports.convert_psq_to_midi){
+        log('WASM missing required exports "malloc", "free", "convert_psq_to_midi". Aborting WASM attempt.', 'err');
+      } else {
+        // helper to copy data to wasm memory
+        function copyToWasm(buf){
+          const len = buf.byteLength;
+          const ptr = exports.malloc(len);
+          const heap = new Uint8Array(exports.memory.buffer, ptr, len);
+          heap.set(new Uint8Array(buf));
+          return {ptr, len};
+        }
+        const sq = found['SQ'] || new Uint8Array(psqBuf);
+        const bd = found['BD'] || new Uint8Array(intBuf);
+        const sqW = copyToWasm(sq);
+        const bdW = copyToWasm(bd);
+
+        // call converter: int convert_psq_to_midi(sq_ptr, sq_len, bd_ptr, bd_len, out_ptr_ptr)
+        // We expect it to return a pointer to MIDI buffer in wasm memory and set length somewhere or return length.
+        // This convention depends on your wasm module — you must adapt the exported function names/params.
+        const midiPtr = exports.convert_psq_to_midi(sqW.ptr, sqW.len, bdW.ptr, bdW.len);
+        if(midiPtr === 0){
+          log('WASM conversion returned 0 (failure).', 'err');
+        } else {
+          const midiLen = exports.get_last_midi_len ? exports.get_last_midi_len() : 0;
+          if(!midiLen){
+            log('WASM did not expose midi length. You must provide a get_last_midi_len() export in the wasm module.', 'warn');
+          } else {
+            const midiBytes = new Uint8Array(exports.memory.buffer, midiPtr, midiLen);
+            downloadBlob(midiBytes.slice(), (psqFile.name.replace(/\.[^/.]+$/, '') || 'out') + '.mid', 'audio/midi');
+            log('MIDI converted and ready for download.', 'ok');
+          }
+        }
+
+        // free used memory
+        exports.free(sqW.ptr);
+        exports.free(bdW.ptr);
+        // if wasm gives midiPtr ownership, free via exported function if provided
+        if(exports.free_midi_buf && midiPtr) exports.free_midi_buf(midiPtr);
+      }
+    }catch(e){
+      log('WASM conversion failed: '+e.message, 'err');
+      console.error(e);
+    }
+    return;
+  }
+
+  // No wasm: package the extracted files so the user can convert on desktop using VGMToolbox/VGMTrans
+  log('No WASM converter. Packaging extracted files for desktop conversion...', 'warn');
+  // create a ZIP via JSZip (simple inline minimal implementation avoided); fallback: provide blobs
+  // provide direct downloads for found components and full originals
+  downloadBlob(psqBuf, psqFile.name, 'application/octet-stream');
+  downloadBlob(intBuf, intFile.name, 'application/octet-stream');
+
+  if(found['HD']) downloadBlob(found['HD'], 'extracted.HD.bin');
+  if(found['SQ']) downloadBlob(found['SQ'], 'extracted.SQ.bin');
+  if(found['BD']) downloadBlob(found['BD'], 'extracted.BD.bin');
+
+  log('Download the extracted files and run VGMToolbox -> mkpsf2 Front End on your PC (recommended).', 'ok');
+  log('Helpful desktop tools: VGMToolbox, VGMTrans, foobar2000 + foo_psf. See links in the script comments.', 'ok');
+});
+</script>
+
+<p style="margin-top:18px;font-size:90%"><strong>Notes & references:</strong>  
+- Desktop tools that do the reliable conversion: VGMToolbox (PSF2 maker), VGMTrans (sequenced → MIDI). If the browser conversion fails, use the packaged files with those tools. :contentReference[oaicite:1]{index=1}  
+- wasm-based playback projects are possible (see vgmstream-web), but you need to compile or obtain a wasm converter for psq→midi conversion. :contentReference[oaicite:2]{index=2}</p>
+</body>
+</html>
